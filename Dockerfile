@@ -3,6 +3,8 @@ ARG BASE_IMAGE=nvidia/cuda:12.6.0-devel-ubuntu24.04
 FROM ${BASE_IMAGE}
 LABEL maintainer="Hugging Face"
 
+ARG TORCH_EXTRA=cuda
+
 SHELL ["/bin/bash", "-c"]
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -60,7 +62,7 @@ ENV VIRTUAL_ENV=/home/huggingface/venv \
 WORKDIR /home/huggingface/app
 COPY --chown=huggingface:huggingface . .
 
-RUN uv sync --active --frozen --extra cuda
+RUN uv sync --active --frozen --extra "${TORCH_EXTRA}"
 
 COPY --chown=huggingface:huggingface entrypoint.sh /home/huggingface/entrypoint.sh
 RUN chmod +x /home/huggingface/entrypoint.sh
