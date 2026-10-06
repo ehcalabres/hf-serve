@@ -43,10 +43,11 @@ Or if you're on CUDA 12.8 then:
 uv sync --active --frozen --extra cuda-128 --extra flash-attn --preview-features extra-build-dependencies
 ```
 
-> [!NOTE]
-> There's no `cuda-130` (CUDA 13.0) extra for now, as `flash-attn==2.8.3`'s
-> wheel-detection logic predates CUDA 13 and would silently install a mismatched
-> `cu12` wheel that fails at import time. It'll be added back once upstream fixes this.
+Or for CUDA 13.0, including NVIDIA GB10 / DGX Spark:
+
+```bash
+uv sync --active --frozen --extra cuda-130
+```
 
 > [!WARNING]
 > The default registry for the NVIDIA CUDA wheels for PyTorch is set to CUDA 12.6. If
@@ -58,6 +59,36 @@ uv sync --active --frozen --extra cuda-128 --extra flash-attn --preview-features
 
 ```console
 $ uv run hf-serve --help
+```
+
+## Container images
+
+On each push to `main`, CI publishes images to `ghcr.io/<owner>/hf-serve` using
+the first seven characters of the commit SHA as the tag. Images are built on
+native runners for the architectures listed below:
+
+| Tag | Backend | Architectures |
+| --- | --- | --- |
+| `<sha>` | CUDA 12.6 | `linux/amd64`, `linux/arm64` |
+| `<sha>-cu130-arm64` | CUDA 13.0, tested on NVIDIA GB10 / DGX Spark | `linux/arm64` |
+| `<sha>-cpu` | CPU | `linux/amd64`, `linux/arm64` |
+
+For example, to pull the CUDA 13.0 image published by the upstream repository:
+
+```bash
+docker pull ghcr.io/huggingface/hf-serve:<sha>-cu130-arm64
+```
+
+Use a commit published after multi-platform support was added; older tags may
+only contain AMD64 images. Docker selects the architecture for the host.
+
+To build the CUDA 13.0 variant locally from this checkout:
+
+```bash
+docker buildx build --platform linux/arm64 \
+  --build-arg BASE_IMAGE=nvidia/cuda:13.0.2-devel-ubuntu24.04 \
+  --build-arg TORCH_EXTRA=cuda-130 \
+  --tag hf-serve:gb10 --load .
 ```
 
 ## Examples

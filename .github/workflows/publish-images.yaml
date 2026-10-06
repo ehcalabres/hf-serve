@@ -4,27 +4,46 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 
 permissions: {}
 
 jobs:
-  publish:
+  build:
     permissions:
       contents: read
       packages: write
-    name: Publish ${{ matrix.variant }} image
-    runs-on: ubuntu-latest
+    name: Build ${{ matrix.variant }} (${{ matrix.architecture }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
+        architecture: [amd64, arm64]
+        variant: [CUDA, CUDA130, CPU]
+        exclude:
+          - architecture: amd64
+            variant: CUDA130
         include:
+          - architecture: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+          - architecture: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
           - variant: CUDA
             dockerfile: Dockerfile
-            suffix: ""
+            build_args: |
+              BASE_IMAGE=nvidia/cuda:12.6.0-devel-ubuntu24.04
+              TORCH_EXTRA=cuda
+          - variant: CUDA130
+            dockerfile: Dockerfile
+            build_args: |
+              BASE_IMAGE=nvidia/cuda:13.0.2-devel-ubuntu24.04
+              TORCH_EXTRA=cuda-130
           - variant: CPU
             dockerfile: Dockerfile.cpu
-            suffix: -cpu
+            build_args: BASE_IMAGE=ubuntu:24.04
 
     steps:
       - name: Checkout repository
@@ -42,24 +61,103 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set image tag
+      - name: Set image name
         id: image
         shell: bash
         run: |
           image_name="ghcr.io/${GITHUB_REPOSITORY,,}"
-          short_sha="${GITHUB_SHA::7}"
           echo "name=${image_name}" >> "${GITHUB_OUTPUT}"
-          echo "tag=${image_name}:${short_sha}${{ matrix.suffix }}" >> "${GITHUB_OUTPUT}"
 
       - name: Build and push image
+        id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc  # v7.4.0
         with:
           context: .
           file: ${{ matrix.dockerfile }}
+          platforms: ${{ matrix.platform }}
+          build-args: ${{ matrix.build_args }}
           push: true
-          tags: ${{ steps.image.outputs.tag }}
+          outputs: type=image,name=${{ steps.image.outputs.name }},push-by-digest=true,name-canonical=true
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-          cache-from: type=gha,scope=${{ matrix.variant }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}
+          cache-from: type=gha,scope=${{ matrix.variant }}-${{ matrix.architecture }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}-${{ matrix.architecture }}
+
+      - name: Export image digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/digests"
+          touch "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
+
+      - name: Upload image digest
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: digests-${{ matrix.variant }}-${{ matrix.architecture }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    permissions:
+      packages: write
+    name: Publish ${{ matrix.variant.name }} image
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - name: CUDA
+            suffix: ""
+            architectures: [amd64, arm64]
+          - name: CUDA130
+            suffix: -cu130-arm64
+            architectures: [arm64]
+          - name: CPU
+            suffix: -cpu
+            architectures: [amd64, arm64]
+
+    steps:
+      - name: Download image digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-${{ matrix.variant.name }}-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish and verify image
+        env:
+          IMAGE_SUFFIX: ${{ matrix.variant.suffix }}
+          EXPECTED_ARCHITECTURES: ${{ toJSON(matrix.variant.architectures) }}
+        working-directory: ${{ runner.temp }}/digests
+        shell: bash
+        run: |
+          image_name="ghcr.io/${GITHUB_REPOSITORY,,}"
+          image_tag="${image_name}:${GITHUB_SHA::7}${IMAGE_SUFFIX}"
+          expected_count="$(jq 'length' <<< "${EXPECTED_ARCHITECTURES}")"
+          digests=(*)
+          if [[ "${#digests[@]}" -ne "${expected_count}" ]]; then
+            echo "Expected ${expected_count} architecture digests, found ${#digests[@]}." >&2
+            exit 1
+          fi
+          images=()
+          for digest in "${digests[@]}"; do
+            images+=("${image_name}@sha256:${digest}")
+          done
+          docker buildx imagetools create --tag "${image_tag}" "${images[@]}"
+          docker buildx imagetools inspect "${image_tag}"
+          docker buildx imagetools inspect "${image_tag}" --raw |
+            jq -e --argjson expected "${EXPECTED_ARCHITECTURES}" \
+              '[.manifests[].platform | select(.os == "linux") | .architecture] | sort == ($expected | sort)'
